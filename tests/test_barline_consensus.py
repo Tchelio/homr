@@ -2,6 +2,7 @@ import unittest
 
 from homr.profiles.barline_consensus import reconcile_system_barlines
 from homr.profiles.structural_recovery import recover_suppressed_barline_prefixes
+from homr.profiles.structural_recovery import reconcile_spatial_rest_semantics
 from homr.transformer.vocabulary import EncodedSymbol
 
 
@@ -67,6 +68,39 @@ class TestBarlineConsensus(unittest.TestCase):
         self.assertEqual(recovered, 1)
         self.assertEqual([symbol.rhythm for symbol in voice], ["barline", "rest_4", "note_2", "barline"])
 
+    def test_spatial_rest_semantics_reuses_existing_rest_and_note_evidence(self) -> None:
+        left = _symbol("barline", 0)
+        first = _symbol("note_4", 50)
+        first.pitch = "E3"
+        first.visual_notehead_solid_score = 0.6
+        second = _symbol("note_4", 100)
+        second.pitch = "G3"
+        second.visual_notehead_solid_score = 0.0
+        second.pitch_candidates = [("G3", 0.7), ("_", 0.15)]
+        second.rhythm_candidates = [("note_4", 0.7), ("rest_4", 0.12)]
+        third = _symbol("note_2", 150)
+        third.pitch = "_"
+        third.visual_notehead_solid_score = 0.0
+        third.pitch_candidates = [("_", 0.7)]
+        third.rhythm_candidates = [("note_2", 0.6), ("rest_2", 0.2)]
+        fourth = _symbol("note_2", 250)
+        fourth.pitch = "_"
+        fourth.visual_notehead_solid_score = 0.0
+        fourth.pitch_candidates = [("_", 0.7)]
+        fourth.rhythm_candidates = [("note_2", 0.6), ("rest_2", 0.2)]
+        last = _symbol("note_2", 350)
+        last.pitch = "G3"
+        last.visual_notehead_solid_score = 0.6
+        right = _symbol("barline", 400)
+        voice = [left, first, second, third, fourth, last, right]
+
+        corrected = reconcile_spatial_rest_semantics([voice], 4, 4, "test")
+
+        self.assertEqual(corrected, 1)
+        self.assertEqual(
+            [symbol.rhythm for symbol in voice],
+            ["barline", "note_8", "rest_8", "rest_4", "rest_4", "note_8", "barline"],
+        )
 
 if __name__ == "__main__":
     unittest.main()

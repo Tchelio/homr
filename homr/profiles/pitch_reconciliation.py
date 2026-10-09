@@ -79,6 +79,7 @@ def reconcile_repeated_tremolo_pitches(
     profile_name: str,
     *,
     allow_structural_recovery: bool = False,
+    allow_recovered_geometry_fallback: bool = False,
 ) -> int:
     """
     Reconsider a same-pitch tremolo pair only when independent evidence agrees.
@@ -99,7 +100,8 @@ def reconcile_repeated_tremolo_pitches(
     for part_index, voice in enumerate(staffs, 1):
         for measure_index, measure in enumerate(_measure_note_groups(voice), 1):
             recovered_measure = allow_structural_recovery and any(
-                symbol.structural_recovery for symbol in measure
+                symbol.structural_recovery or symbol.missing_rest_recovery
+                for symbol in measure
             )
             rest_count = sum(1 for symbol in measure if symbol.rhythm.startswith("rest"))
             pitched_notes = [symbol for symbol in measure if symbol.rhythm.startswith("note")]
@@ -115,7 +117,11 @@ def reconcile_repeated_tremolo_pitches(
                 continue
 
             pairs = _tremolo_pairs(measure)
-            if len(pairs) < 2:
+            if len(pairs) < 2 and not (
+                allow_recovered_geometry_fallback
+                and recovered_measure
+                and len(pairs) == 1
+            ):
                 continue
 
             reference_patterns: set[tuple[str, str]] = set()
@@ -136,9 +142,6 @@ def reconcile_repeated_tremolo_pitches(
                 if visual_direction == 0 or visual_direction != _pitch_direction(pitches):
                     continue
                 reference_patterns.add(pitches)
-
-            if not reference_patterns:
-                continue
 
             proposals: list[tuple[EncodedSymbol, str, float, tuple[str, str]]] = []
             for pair in pairs:
@@ -163,10 +166,22 @@ def reconcile_repeated_tremolo_pitches(
                         proposed = [pair[0].pitch, pair[1].pitch]
                         proposed[uncertain_index] = alternative
                         pattern = (proposed[0], proposed[1])
-                        if pattern not in reference_patterns:
-                            continue
-                        if not recovered_measure and visual_direction != _pitch_direction(pattern):
-                            continue
+                        if reference_patterns:
+                            if pattern not in reference_patterns:
+                                continue
+                            if (
+                                not recovered_measure
+                                and visual_direction != _pitch_direction(pattern)
+                            ):
+                                continue
+                        else:
+                            if not (
+                                allow_recovered_geometry_fallback
+                                and recovered_measure
+                                and visual_direction != 0
+                                and visual_direction == _pitch_direction(pattern)
+                            ):
+                                continue
                         proposals.append((uncertain, alternative, probability, pattern))
 
             # Fail closed if more than one interpretation survives the constraints.

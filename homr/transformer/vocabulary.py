@@ -332,6 +332,12 @@ class EncodedSymbol:
         # only opt-in reconciliation profiles may use them to alter recognition.
         self.visual_notehead_solid_score: float = 0.0
         self.visual_tremolo_with_next_bars: int = 0
+        # Raw-page evidence for a compact, unparsed staff-interior glyph in the horizontal
+        # gap after this event.  This is intentionally generic: it does not claim the glyph
+        # is a rest or assign a duration.  An opt-in score profile may combine it with meter
+        # and already-decoded musical structure to propose a missing symbol conservatively.
+        self.visual_gap_after_score: float = 0.0
+        self.visual_gap_after_page_x: float | None = None
         # Measure-level independent visual/decoder diagnostics. These are populated while
         # the staff still has access to page coordinates, then consumed by fail-closed
         # consistency validators after systems have been concatenated into voices.
@@ -342,6 +348,7 @@ class EncodedSymbol:
         self.structural_visual_mismatch: bool = False
         self.suppressed_barline_after_page_x: float | None = None
         self.structural_recovery: bool = False
+        self.missing_rest_recovery: bool = False
         # Reconciliation metadata. A confirmed double-note tremolo keeps its written note
         # type but occupies half that note's nominal duration. Keeping that distinction here
         # lets measure inference and MusicXML serialization agree on the same timing model.

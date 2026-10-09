@@ -122,17 +122,30 @@ def _explicit_double_pairs(
     return pairs
 
 
-def _visual_double_pairs(events: list[EncodedSymbol]) -> list[tuple[EncodedSymbol, EncodedSymbol]]:
+def _visual_double_pairs(
+    events: list[EncodedSymbol],
+    explicit_pairs: list[tuple[EncodedSymbol, EncodedSymbol]],
+    allow_repeated_pattern_medium_evidence: bool,
+) -> list[tuple[EncodedSymbol, EncodedSymbol]]:
     result: list[tuple[EncodedSymbol, EncodedSymbol]] = []
+    explicit_patterns = {(first.pitch, second.pitch) for first, second in explicit_pairs}
     for index in range(len(events) - 1):
         first = events[index]
         second = events[index + 1]
         if not first.rhythm.startswith("note") or not second.rhythm.startswith("note"):
             continue
-        # Five repeated short bars is intentionally conservative: on the current page this
-        # separates the missed tremolo from ordinary ledger/slur residue. The image detector
-        # only proposes a candidate; exact meter fit still has to make it uniquely actionable.
-        if first.visual_tremolo_with_next_bars < 5:
+        bars = first.visual_tremolo_with_next_bars
+        strong_visual_evidence = bars >= 5
+        repeated_pattern_medium_evidence = (
+            allow_repeated_pattern_medium_evidence
+            and bars >= 4
+            and (first.pitch, second.pitch) in explicit_patterns
+        )
+        # Five repeated short bars remains the standalone conservative threshold. Four bars
+        # may be admitted only as medium evidence when the same ordered pitch pair is already
+        # present as an explicit tremolo in this measure. The meter solver still has to make
+        # the combined interpretation uniquely actionable.
+        if not strong_visual_evidence and not repeated_pattern_medium_evidence:
             continue
         if first.get_duration().fraction != second.get_duration().fraction:
             continue
@@ -146,6 +159,9 @@ def _candidate_actions(
     measure: list[EncodedSymbol],
     allow_dotted_tremolo: bool,
     allow_rest_rhythm_alternatives: bool,
+    allow_repeated_pattern_medium_tremolo: bool,
+    allow_visual_uncertain_quarter_to_eighth: bool,
+    allow_deeper_rest_rhythm_alternatives: bool,
 ) -> list[_Action]:
     events = _events(measure)
     actions: list[_Action] = []
@@ -182,7 +198,11 @@ def _candidate_actions(
                 )
             )
 
-    for first, second in _visual_double_pairs(events):
+    for first, second in _visual_double_pairs(
+        events,
+        explicit,
+        allow_repeated_pattern_medium_evidence=allow_repeated_pattern_medium_tremolo,
+    ):
         covered = frozenset((id(first), id(second)))
         if covered in explicit_ids:
             continue
@@ -191,19 +211,54 @@ def _candidate_actions(
         actions.append(_Action("visual-tremolo", covered, duration, (first, second)))
 
     for symbol in events:
-        if symbol.rhythm != "note_2" or symbol.visual_notehead_solid_score < 0.6:
+        if not re.match(r"^note_2(\.{0,2})$", symbol.rhythm):
             continue
-        duration = symbol.get_duration().fraction
+        if symbol.visual_notehead_solid_score < 0.6:
+            continue
+        replacement_rhythm = _shorter_rhythm_token(symbol.rhythm)
+        if replacement_rhythm is None:
+            continue
+        current_duration = symbol.get_duration().fraction
+        old_rhythm = symbol.rhythm
+        symbol.rhythm = replacement_rhythm
+        symbol._duration = None
+        replacement_duration = symbol.get_duration().fraction
+        symbol.rhythm = old_rhythm
+        symbol._duration = None
         actions.append(
             _Action(
                 "solid-half-to-quarter",
                 frozenset((id(symbol),)),
-                duration - Fraction(1, 4),
+                current_duration - replacement_duration,
                 single=symbol,
-                replacement_rhythm="note_4",
+                replacement_rhythm=replacement_rhythm,
                 evidence_score=math.log(max(symbol.visual_notehead_solid_score, 1e-9)),
             )
         )
+
+    if allow_visual_uncertain_quarter_to_eighth:
+        for symbol in events:
+            if symbol.rhythm != "note_4" or _has_tremolo(symbol):
+                continue
+            # The independent notehead branch does not support the transformer's otherwise
+            # confident quarter-note reading.  This is uncertainty evidence, not an eighth-
+            # note classifier: exact meter must still need the change, and decoder top-k is
+            # retained as the ranking evidence when multiple exact solutions compete.
+            if symbol.visual_notehead_solid_score > 0.05:
+                continue
+            alternative_probability = _rhythm_candidate_probability(symbol, "note_8")
+            if alternative_probability <= 0:
+                continue
+            actions.append(
+                _Action(
+                    "visual-uncertain-quarter-to-eighth",
+                    frozenset((id(symbol),)),
+                    Fraction(1, 8),
+                    single=symbol,
+                    replacement_rhythm="note_8",
+                    evidence_score=math.log(max(alternative_probability, 1e-9)),
+                )
+            )
 
     if allow_rest_rhythm_alternatives:
         for symbol in events:
@@ -212,33 +267,38 @@ def _candidate_actions(
             shorter = _shorter_rhythm_token(symbol.rhythm)
             if shorter is None:
                 continue
-            alternative_probability = _rhythm_candidate_probability(symbol, shorter)
-            # This is deliberately a candidate threshold, not an automatic rewrite. The
-            # exact-meter solver must still need this change, and competing exact solutions
-            # are ranked by decoder evidence. A few-percent second choice is enough to keep
-            # a plausible handwritten rhythm ambiguity alive without exploding the search.
-            if alternative_probability < 0.03:
-                continue
             current_duration = symbol.get_duration().fraction
-            old_rhythm = symbol.rhythm
-            symbol.rhythm = shorter
-            symbol._duration = None
-            shorter_duration = symbol.get_duration().fraction
-            symbol.rhythm = old_rhythm
-            symbol._duration = None
-            reduction = current_duration - shorter_duration
-            if reduction <= 0:
-                continue
-            actions.append(
-                _Action(
-                    "rest-rhythm-shorter",
-                    frozenset((id(symbol),)),
-                    reduction,
-                    single=symbol,
-                    replacement_rhythm=shorter,
-                    evidence_score=math.log(alternative_probability),
+            candidates = [(shorter, _rhythm_candidate_probability(symbol, shorter))]
+            if allow_deeper_rest_rhythm_alternatives:
+                candidates.extend(
+                    (token, probability)
+                    for token, probability in symbol.rhythm_candidates
+                    if token != shorter and _SIMPLE_REST.match(token)
                 )
-            )
+            seen: set[str] = set()
+            for candidate, alternative_probability in candidates:
+                if candidate in seen or alternative_probability < 0.03:
+                    continue
+                seen.add(candidate)
+                old_rhythm = symbol.rhythm
+                symbol.rhythm = candidate
+                symbol._duration = None
+                candidate_duration = symbol.get_duration().fraction
+                symbol.rhythm = old_rhythm
+                symbol._duration = None
+                reduction = current_duration - candidate_duration
+                if reduction <= 0:
+                    continue
+                actions.append(
+                    _Action(
+                        "rest-rhythm-shorter",
+                        frozenset((id(symbol),)),
+                        reduction,
+                        single=symbol,
+                        replacement_rhythm=candidate,
+                        evidence_score=math.log(alternative_probability),
+                    )
+                )
     return actions
 
 
@@ -341,6 +401,10 @@ def reconcile_unique_measure_constraints(
     allow_rest_rhythm_alternatives: bool = False,
     prefer_evidence_when_ambiguous: bool = False,
     remove_visual_pair_slurs: bool = False,
+    require_all_explicit_tremolo_pairs: bool = False,
+    allow_repeated_pattern_medium_tremolo: bool = False,
+    allow_visual_uncertain_quarter_to_eighth: bool = False,
+    allow_deeper_rest_rhythm_alternatives: bool = False,
 ) -> int:
     """Resolve only uniquely-supported overfull measures from reusable evidence classes."""
     target = Fraction(beats, beat_type)
@@ -357,6 +421,9 @@ def reconcile_unique_measure_constraints(
                 measure,
                 allow_dotted_tremolo=allow_dotted_tremolo,
                 allow_rest_rhythm_alternatives=allow_rest_rhythm_alternatives,
+                allow_repeated_pattern_medium_tremolo=allow_repeated_pattern_medium_tremolo,
+                allow_visual_uncertain_quarter_to_eighth=allow_visual_uncertain_quarter_to_eighth,
+                allow_deeper_rest_rhythm_alternatives=allow_deeper_rest_rhythm_alternatives,
             )
             solution = _find_solution(
                 actions,
@@ -365,6 +432,32 @@ def reconcile_unique_measure_constraints(
             )
             if solution is None:
                 continue
+
+            if require_all_explicit_tremolo_pairs:
+                explicit_pairs = _explicit_double_pairs(
+                    events, allow_dotted_tremolo=allow_dotted_tremolo
+                )
+                selected_pair_ids = {
+                    id(symbol)
+                    for action in solution
+                    if action.pair is not None
+                    for symbol in action.pair
+                }
+                if any(
+                    id(first) not in selected_pair_ids or id(second) not in selected_pair_ids
+                    for first, second in explicit_pairs
+                ):
+                    # An exact meter fit is not enough evidence to erase a second explicit
+                    # tremolo interpretation.  Leave the measure unresolved rather than
+                    # silently stripping an unselected model pair after applying the chosen
+                    # correction.  Older profiles keep their historical behavior unless
+                    # they opt into this fail-closed guard.
+                    eprint(
+                        f"PROFILE {profile_name} P{part_index} m{measure_index} "
+                        "EXPLICIT_TREMOLO_CONFLICT: exact-fit solution would discard "
+                        "an unselected explicit tremolo pair; recognition left unchanged"
+                    )
+                    continue
 
             selected_pair_ids: set[int] = set()
             for action in solution:

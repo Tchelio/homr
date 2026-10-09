@@ -3,8 +3,13 @@ from __future__ import annotations
 import statistics
 from fractions import Fraction
 
+from homr.profiles.measure_constraint_solver import (
+    _events,
+    _explicit_double_pairs,
+    _remove_tremolo,
+)
 from homr.simple_logging import eprint
-from homr.transformer.vocabulary import EncodedSymbol
+from homr.transformer.vocabulary import EncodedSymbol, empty
 
 
 def _is_barline(symbol: EncodedSymbol) -> bool:
@@ -116,3 +121,144 @@ def recover_suppressed_barline_prefixes(
     eprint(f"PROFILE {profile_name}: structural prefix recoveries={recovered}")
     return recovered
 
+
+def _candidate_probability(candidates: list[tuple[str, float]], token: str) -> float:
+    return next((probability for candidate, probability in candidates if candidate == token), 0.0)
+
+
+def reconcile_spatial_rest_semantics(
+    staffs: list[list[EncodedSymbol]],
+    beats: int,
+    beat_type: int,
+    profile_name: str,
+    *,
+    minimum_rest_or_empty_support: float = 0.10,
+) -> int:
+    """Reinterpret note tokens as rests only when independent evidence agrees.
+
+    The XML writer already treats pitch ``_`` as a rest.  This reconciliation makes the
+    symbol stream agree with that semantic meaning earlier, and also admits a pitched note
+    when notehead evidence is absent and both decoder alternatives / spatial duration support
+    a rest interpretation.  Existing spatial-duration classification supplies the written
+    value; it does not assume that every measure event was recognized.
+    """
+    corrected = 0
+    for part_index, voice in enumerate(staffs, 1):
+        left_boundary_x: float | None = None
+        measure_start = 0
+        index = 0
+        while index < len(voice):
+            symbol = voice[index]
+            if symbol.rhythm == "newline":
+                left_boundary_x = None
+                measure_start = index + 1
+                index += 1
+                continue
+            if not _is_barline(symbol):
+                index += 1
+                continue
+
+            right_boundary_x = _boundary_x(symbol)
+            measure = voice[measure_start : index + 1]
+            events = _events(measure)
+            if left_boundary_x is not None and right_boundary_x is not None and events:
+                width = right_boundary_x - left_boundary_x
+                if width > 0:
+                    rest_proposals: list[tuple[EncodedSymbol, str]] = []
+                    spatial_rhythms: dict[int, str] = {}
+                    proposal_valid = True
+                    for event_index, event in enumerate(events):
+                        if event.page_coordinates is None:
+                            proposal_valid = False
+                            break
+                        event_x = float(event.page_coordinates[0])
+                        next_x = (
+                            float(events[event_index + 1].page_coordinates[0])
+                            if event_index + 1 < len(events)
+                            and events[event_index + 1].page_coordinates is not None
+                            else right_boundary_x
+                        )
+                        spatial = _best_spatial_rest(
+                            (next_x - event_x) / width,
+                            beats=beats,
+                            beat_type=beat_type,
+                        )
+                        if spatial is None:
+                            spatial_rhythms[id(event)] = ""
+                            continue
+                        rest_rhythm, _error = spatial
+                        spatial_rhythms[id(event)] = rest_rhythm
+
+                        if not event.rhythm.startswith("note"):
+                            continue
+                        if event.visual_notehead_solid_score > 0.05:
+                            continue
+                        empty_pitch_support = _candidate_probability(
+                            event.pitch_candidates, empty
+                        )
+                        rest_support = max(
+                            (
+                                probability
+                                for rhythm, probability in event.rhythm_candidates
+                                if rhythm.startswith("rest_")
+                            ),
+                            default=0.0,
+                        )
+                        if event.pitch != empty and max(empty_pitch_support, rest_support) < minimum_rest_or_empty_support:
+                            continue
+                        rest_proposals.append((event, rest_rhythm))
+
+                    if proposal_valid and rest_proposals:
+                        # Once one or more rest-like hallucinations are independently
+                        # established, reuse the same spatial duration evidence for the
+                        # remaining pitched events.  Fail closed if a remaining note has no
+                        # unique spatial duration.
+                        note_updates: list[tuple[EncodedSymbol, str]] = []
+                        rest_ids = {id(event) for event, _ in rest_proposals}
+                        for event in events:
+                            if id(event) in rest_ids or not event.rhythm.startswith("note"):
+                                continue
+                            rest_rhythm = spatial_rhythms.get(id(event), "")
+                            if not rest_rhythm:
+                                proposal_valid = False
+                                break
+                            note_updates.append(
+                                (event, rest_rhythm.replace("rest_", "note_", 1))
+                            )
+
+                        if proposal_valid:
+                            for event, rest_rhythm in rest_proposals:
+                                event.rhythm = rest_rhythm
+                                event.pitch = empty
+                                event.slur = empty
+                                event._duration = None
+                                event.structural_recovery = True
+                                _remove_tremolo(event)
+                            for event, note_rhythm in note_updates:
+                                event.rhythm = note_rhythm
+                                event._duration = None
+                                event.structural_recovery = True
+
+                            pairs = _explicit_double_pairs(
+                                events, allow_dotted_tremolo=True
+                            )
+                            paired_ids = {id(item) for pair in pairs for item in pair}
+                            for event in events:
+                                if (
+                                    event.rhythm.startswith("note")
+                                    and id(event) not in paired_ids
+                                ):
+                                    _remove_tremolo(event)
+                            corrected += 1
+                            eprint(
+                                f"PROFILE {profile_name} P{part_index} "
+                                "SPATIAL_REST_SEMANTICS: "
+                                f"rests={len(rest_proposals)}, notes={len(note_updates)}"
+                            )
+
+            left_boundary_x = right_boundary_x
+            measure_start = index + 1
+            index += 1
+
+    eprint(f"PROFILE {profile_name}: spatial rest semantic corrections={corrected}")
+    return corrected

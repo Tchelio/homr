@@ -335,6 +335,72 @@ def _get_symbol_center(symbol: EncodedSymbol) -> tuple[float, float] | None:
     return float(center[0]), float(center[1])
 
 
+def _barline_geometry_fitness(staff: Staff, box: RotatedBoundingBox) -> float:
+    """Prefer vertical boxes that actually span and center on the staff.
+
+    TrOMR's barline token localizes only approximately. Stage-1 can therefore expose
+    several nearby vertical boxes, including note stems. A real barline normally covers
+    almost the whole five-line staff and is vertically centered on it; stems commonly do
+    neither. Keep this as an image-geometry score only -- musical/system topology remains
+    the responsibility of the later profile reconciliation.
+    """
+    point = staff.get_at(float(box.center[0]))
+    if point is None:
+        return float("-inf")
+    staff_top = float(point.y[0])
+    staff_bottom = float(point.y[-1])
+    staff_span = max(staff_bottom - staff_top, 1e-6)
+    staff_mid = (staff_top + staff_bottom) / 2
+    box_top = float(box.center[1] - box.size[1] / 2)
+    box_bottom = float(box.center[1] + box.size[1] / 2)
+    overlap = max(0.0, min(box_bottom, staff_bottom) - max(box_top, staff_top))
+    coverage = overlap / staff_span
+    center_offset = abs(float(box.center[1]) - staff_mid) / (staff_span / 2)
+    protrusion = (
+        max(0.0, staff_top - box_top) + max(0.0, box_bottom - staff_bottom)
+    ) / staff_span
+    return coverage - 0.30 * center_offset - 0.20 * protrusion
+
+
+def _select_stage1_barline_geometry(
+    staff: Staff,
+    semantic_x: float,
+    candidates: list[RotatedBoundingBox],
+) -> RotatedBoundingBox | None:
+    """Choose a clearly more barline-like Stage-1 box without making long jumps.
+
+    Preserve the old nearest-x behavior unless another nearby candidate has materially
+    stronger staff-spanning geometry. The distance guard is important: an isolated false
+    TrOMR barline must not be snapped onto a real boundary several symbols away.
+    """
+    if not candidates:
+        return None
+    unit = max(float(staff.average_unit_size), 1e-6)
+    nearby = [box for box in candidates if abs(float(box.center[0]) - semantic_x) <= 12 * unit]
+    if not nearby:
+        return None
+    nearest = min(nearby, key=lambda box: abs(float(box.center[0]) - semantic_x))
+    best = max(
+        nearby,
+        key=lambda box: (
+            _barline_geometry_fitness(staff, box),
+            -abs(float(box.center[0]) - semantic_x),
+        ),
+    )
+    nearest_fitness = _barline_geometry_fitness(staff, nearest)
+    best_fitness = _barline_geometry_fitness(staff, best)
+    nearest_distance = abs(float(nearest.center[0]) - semantic_x) / unit
+    best_distance = abs(float(best.center[0]) - semantic_x) / unit
+    if (
+        best is not nearest
+        and best_fitness >= 0.72
+        and best_fitness >= nearest_fitness + 0.15
+        and best_distance <= nearest_distance + 2.0
+    ):
+        return best
+    return nearest
+
+
 def parse_staff_image(
     debug: Debug,
     index: int,
@@ -372,17 +438,11 @@ def parse_staff_image(
             symbol.page_coordinates = page_center
             symbol.image_coordinates = page_to_input_image(page_center)
             if "barline" in symbol.rhythm or "repeat" in symbol.rhythm:
-                nearest = min(
-                    stage1_barlines,
-                    key=lambda box: abs(box.center[0] - page_center[0]),
-                    default=None,
+                geometry = _select_stage1_barline_geometry(
+                    page_staff, float(page_center[0]), stage1_barlines
                 )
-                if (
-                    nearest is not None
-                    and abs(nearest.center[0] - page_center[0])
-                    <= 12 * page_staff.average_unit_size
-                ):
-                    symbol.barline_geometry_page_x = float(nearest.center[0])
+                if geometry is not None:
+                    symbol.barline_geometry_page_x = float(geometry.center[0])
                     symbol.barline_geometry_unit_size = float(page_staff.average_unit_size)
     if debug.debug:
         result_image = staff_image.copy()

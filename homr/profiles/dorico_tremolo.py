@@ -104,7 +104,8 @@ def normalize_dorico_reference_tremolos(root: ET.Element, profile_name: str) -> 
     for part in root.findall("part"):
         for measure in part.findall("measure"):
             notes = [note for note in measure.findall("note") if note.find("chord") is None]
-            paired_note_ids: set[int] = set()
+            confirmed_pair_note_ids: set[int] = set()
+            has_normalized_pair = False
 
             for index in range(len(notes) - 1):
                 first, second = notes[index], notes[index + 1]
@@ -123,28 +124,45 @@ def normalize_dorico_reference_tremolos(root: ET.Element, profile_name: str) -> 
                     continue
 
                 if first_type == "half":
+                    confirmed_pair_note_ids.add(id(first))
+                    confirmed_pair_note_ids.add(id(second))
+                    has_normalized_pair = True
                     _remove_beams(first)
                     _remove_beams(second)
                     _set_tremolo_marks(first, 4)
                     _set_tremolo_marks(second, 4)
                 elif first_type == "eighth":
+                    confirmed_pair_note_ids.add(id(first))
+                    confirmed_pair_note_ids.add(id(second))
+                    has_normalized_pair = True
                     _insert_beam(first, "begin")
                     _insert_beam(second, "end")
                     _set_tremolo_marks(first, 3)
                     _set_tremolo_marks(second, 3)
-                else:
-                    # No Dorico round-trip evidence yet for this note type. Fail closed.
+                elif first.find("dot") is not None and second.find("dot") is not None:
+                    # Dotted written values are already semantically confirmed by the 2:1
+                    # timing and start/stop pair, but we do not yet have a Dorico-specific
+                    # normalization recipe for them. Preserve the writer's marks unchanged.
+                    # This avoids deleting a valid dotted tremolo merely because another,
+                    # supported pair appears in the same measure.
+                    confirmed_pair_note_ids.add(id(first))
+                    confirmed_pair_note_ids.add(id(second))
                     continue
-
-                paired_note_ids.add(id(first))
-                paired_note_ids.add(id(second))
+                else:
+                    # No Dorico round-trip evidence yet for this note type. Fail closed on
+                    # normalization and retain the historical cleanup behavior.
+                    continue
                 normalized_pairs += 1
 
-            if not paired_note_ids:
+            # Preserve the historical behavior of measures containing only unsupported
+            # written values: without a half/eighth pair there was never a cleanup pass.
+            # A dotted pair only protects itself when cleanup is already required by a
+            # supported pair in the same measure.
+            if not has_normalized_pair:
                 continue
 
             for note in notes:
-                if id(note) in paired_note_ids:
+                if id(note) in confirmed_pair_note_ids:
                     continue
                 tremolo = _tremolo(note)
                 if tremolo is not None and tremolo.get("type") in ("start", "stop"):
