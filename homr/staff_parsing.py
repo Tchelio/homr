@@ -4,6 +4,7 @@ import cv2
 import numpy as np
 
 from homr import constants
+from homr.bounding_boxes import RotatedBoundingBox
 from homr.debug import Debug
 from homr.image_utils import crop_image_and_return_new_top
 from homr.model import MultiStaff, Staff
@@ -15,6 +16,7 @@ from homr.staff_regions import StaffRegions
 from homr.transformer.configs import Config, default_config
 from homr.transformer.vocabulary import EncodedSymbol, remove_duplicated_symbols
 from homr.type_definitions import NDArray
+from homr.visual_evidence import VisualEvidencePage
 
 
 def _flatten_staffs(staffs: list[MultiStaff]) -> list[Staff]:
@@ -341,16 +343,47 @@ def parse_staff_image(
     regions: StaffRegions,
     config: Config,
     page_to_input_image: PointMapping = identity,
+    visual_evidence: VisualEvidencePage | None = None,
+    bar_line_boxes: list[RotatedBoundingBox] | None = None,
 ) -> list[EncodedSymbol]:
+    page_staff = staff
     staff_image, transformed_staff, staff_to_page = prepare_staff_image(
         debug, index, staff, image, regions=regions
     )
     eprint("Running TrOmr inference on staff image", index)
     result = parse_staff_tromr(staff_image=staff_image, staff=transformed_staff, config=config)
+
+    stage1_barlines: list[RotatedBoundingBox] = []
+    if bar_line_boxes is not None:
+        for box in bar_line_boxes:
+            point = page_staff.get_at(box.center[0])
+            if point is None:
+                continue
+            tolerance = 1.6 * point.average_unit_size
+            if point.y[0] - tolerance <= box.center[1] <= point.y[-1] + tolerance:
+                stage1_barlines.append(box)
+
+    if visual_evidence is not None:
+        visual_evidence.annotate_symbols(result, page_staff, staff_to_page)
     for symbol in result:
         center = _get_symbol_center(symbol)
         if center is not None:
-            symbol.image_coordinates = page_to_input_image(staff_to_page(center))
+            page_center = staff_to_page(center)
+            symbol.page_coordinates = page_center
+            symbol.image_coordinates = page_to_input_image(page_center)
+            if "barline" in symbol.rhythm or "repeat" in symbol.rhythm:
+                nearest = min(
+                    stage1_barlines,
+                    key=lambda box: abs(box.center[0] - page_center[0]),
+                    default=None,
+                )
+                if (
+                    nearest is not None
+                    and abs(nearest.center[0] - page_center[0])
+                    <= 12 * page_staff.average_unit_size
+                ):
+                    symbol.barline_geometry_page_x = float(nearest.center[0])
+                    symbol.barline_geometry_unit_size = float(page_staff.average_unit_size)
     if debug.debug:
         result_image = staff_image.copy()
         for i, symbol in enumerate(result):
@@ -380,6 +413,8 @@ def parse_staffs(
     config: Config,
     selected_staff: int = -1,
     page_to_input_image: PointMapping = identity,
+    notehead_mask: NDArray | None = None,
+    bar_line_boxes: list[RotatedBoundingBox] | None = None,
 ) -> list[list[EncodedSymbol]]:
     """
     Dewarps each staff and then runs it through an algorithm which extracts
@@ -395,6 +430,7 @@ def parse_staffs(
     i = 0
     voices = []
     regions = StaffRegions(staffs)
+    visual_evidence = VisualEvidencePage(image, notehead_mask) if notehead_mask is not None else None
     for voice in range(number_of_voices):
         staffs_for_voice = [staff.staffs[voice] for staff in staffs]
         result_for_voice = []
@@ -404,7 +440,15 @@ def parse_staffs(
                 i += 1
                 continue
             result_staff = parse_staff_image(
-                debug, i, staff, image, regions, config, page_to_input_image
+                debug,
+                i,
+                staff,
+                image,
+                regions,
+                config,
+                page_to_input_image,
+                visual_evidence,
+                bar_line_boxes,
             )
             if len(result_staff) == 0:
                 eprint("Skipping empty staff", i)

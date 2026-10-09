@@ -9,6 +9,7 @@ from fractions import Fraction
 import numpy as np
 
 from homr import constants
+from homr.profiles import apply_profile, apply_symbol_profile
 from homr.simple_logging import eprint
 from homr.transformer.vocabulary import (
     EncodedSymbol,
@@ -67,7 +68,9 @@ class SymbolChord:
 
     def get_duration(self) -> Fraction:
         notes_rests = [
-            s.get_duration().fraction for s in self.symbols if s.rhythm.startswith(("note", "rest"))
+            s.get_effective_duration_fraction()
+            for s in self.symbols
+            if s.rhythm.startswith(("note", "rest"))
         ]
         if len(notes_rests) == 0:
             return Fraction(0)
@@ -87,11 +90,16 @@ class SymbolChord:
 
 class XmlGeneratorArguments:
     def __init__(
-        self, large_page: bool | None = None, metronome: int | None = None, tempo: int | None = None
+        self,
+        large_page: bool | None = None,
+        metronome: int | None = None,
+        tempo: int | None = None,
+        profile: str | None = None,
     ):
         self.large_page = large_page
         self.metronome = metronome
         self.tempo = tempo
+        self.profile = profile
 
 
 def build_identification() -> ET.Element:
@@ -104,6 +112,7 @@ def build_identification() -> ET.Element:
 def generate_xml(
     args: XmlGeneratorArguments, staffs: list[list[EncodedSymbol]], title: str
 ) -> ET.Element:
+    apply_symbol_profile(staffs, args.profile)
     root = ET.Element("score-partwise", version="4.0")
     root.append(build_work(title))
     root.append(build_identification())
@@ -112,6 +121,7 @@ def generate_xml(
     root.append(build_part_list(has_two_staves_by_part))
     for index, staff in enumerate(staffs):
         root.append(build_part(args, staff, index, has_two_staves_by_part[index]))
+    apply_profile(root, args.profile)
     return root
 
 
@@ -152,6 +162,9 @@ def build_measures(
         rebalance_measure_voices(current_measure)
         measures.append(current_measure)
         clock, sounding = Fraction(0), []
+        # Double-note tremolo start/stop pairing is measure-local. A stray or missed
+        # tremolo token must never invert the first pair of every later measure.
+        state.tremolo_state = "stop"
 
     measure_number = 1
     groups = split_mixed_chords(add_tuplet_start_stop(group_into_chords(voice)))
@@ -260,7 +273,9 @@ def _advance_to_next_group(
 ) -> Fraction:
     """How far the next group starts after this one, updating the sounding notes in place."""
     durations = [
-        s.get_duration().fraction for s in group.symbols if s.rhythm.startswith(("note", "rest"))
+        s.get_effective_duration_fraction()
+        for s in group.symbols
+        if s.rhythm.startswith(("note", "rest"))
     ]
     timed = [d for d in durations if d > 0]  # grace notes have no duration and take no time
     if not timed:
@@ -337,7 +352,27 @@ def build_or_get_barline(measure: ET.Element, location: str) -> ET.Element:
 
 
 def build_key(model_key: EncodedSymbol, attributes: ET.Element) -> None:
-    key = ET.SubElement(attributes, "key")
+    # MusicXML attributes use a strict order: divisions, key, time, staves, ..., clef.
+    # Transformer token order is visual and may yield clef before key, so insert key
+    # before any later-order attribute instead of appending it blindly.
+    key = ET.Element("key")
+    insert_at = len(attributes)
+    for index, child in enumerate(attributes):
+        if child.tag in (
+            "time",
+            "staves",
+            "part-symbol",
+            "instruments",
+            "clef",
+            "staff-details",
+            "transpose",
+            "for-part",
+            "directive",
+            "measure-style",
+        ):
+            insert_at = index
+            break
+    attributes.insert(insert_at, key)
     ET.SubElement(key, "fifths").text = model_key.rhythm.split("_")[1]
 
 
@@ -544,7 +579,24 @@ def build_clef(model_clef: EncodedSymbol, attributes: ET.Element) -> None:
 def build_time_signature(
     model_time_signature: EncodedSymbol, attributes: ET.Element, state: ConversionState
 ) -> None:
-    time = ET.SubElement(attributes, "time")
+    # Time follows key and precedes staves / clef in MusicXML's attributes sequence.
+    time = ET.Element("time")
+    insert_at = len(attributes)
+    for index, child in enumerate(attributes):
+        if child.tag in (
+            "staves",
+            "part-symbol",
+            "instruments",
+            "clef",
+            "staff-details",
+            "transpose",
+            "for-part",
+            "directive",
+            "measure-style",
+        ):
+            insert_at = index
+            break
+    attributes.insert(insert_at, time)
     denominator = model_time_signature.rhythm.split("/")[1]
     beats = max(int(state.nominator * int(denominator)), 1)
     ET.SubElement(time, "beats").text = str(beats)
@@ -599,7 +651,11 @@ DURATION_NAMES = {
 
 
 def build_articulations(
-    note: ET.Element, articualations: str, tuplet_mark: str, state: ConversionState
+    note: ET.Element,
+    articualations: str,
+    tuplet_mark: str,
+    state: ConversionState,
+    double_tremolo_role: str | None = None,
 ) -> None:
     notation = ET.SubElement(note, "notations")
 
@@ -626,7 +682,8 @@ def build_articulations(
         elif articulation == "tenuto":
             xml_articulations.append(ET.Element("tenuto"))
         elif articulation == "tremolo":
-            el = ET.Element("tremolo", type=state.toggle_tremolo_state())
+            tremolo_type = double_tremolo_role or state.toggle_tremolo_state()
+            el = ET.Element("tremolo", type=tremolo_type)
             el.text = "3"
             xml_ornaments.append(el)
         elif articulation == "trill":
@@ -696,6 +753,7 @@ def build_note_or_rest(
         ET.SubElement(note, "chord")
     model_pitch = model_note.pitch
     model_duration = model_note.get_duration()
+    effective_duration = model_note.get_effective_duration_fraction()
 
     if "G" in model_note.rhythm:
         ET.SubElement(note, "grace")
@@ -711,39 +769,52 @@ def build_note_or_rest(
     else:
         pitch = ET.SubElement(note, "pitch")
         ET.SubElement(pitch, "step").text = model_pitch[0]
-        ET.SubElement(pitch, "octave").text = model_pitch[1]
         if model_note.lift == nonote:
             eprint("WARNING note with invalid lift", model_note)
         elif model_note.lift != empty:
             ET.SubElement(pitch, "alter").text = str(LIFT_TO_ALTER[model_note.lift])
+        ET.SubElement(pitch, "octave").text = model_pitch[1]
 
+    staff_num = get_staff(model_note)
+    slur_number = staff_num
+
+    # In MusicXML note content, voice precedes type / dot / time-modification.
+    # Keep it immediately after the sounding fields (pitch/rest, duration, ties).
     if "G" in model_note.rhythm:
+        ET.SubElement(note, "voice").text = str(get_xml_voice(staff_num, rhythmic_layer))
         base_duration = model_duration.kern
         ET.SubElement(note, "type").text = DURATION_NAMES[base_duration]
     elif model_duration.fraction.numerator > 0:
         base_duration = 1 if model_duration.kern == 0 else model_duration.kern
-        ET.SubElement(note, "duration").text = str(
-            max(1, int(model_duration.fraction * state.division))
-        )
+        ET.SubElement(note, "duration").text = str(max(1, int(effective_duration * state.division)))
+        ET.SubElement(note, "voice").text = str(get_xml_voice(staff_num, rhythmic_layer))
         ET.SubElement(note, "type").text = DURATION_NAMES[base_duration]
     else:
         ET.SubElement(note, "duration").text = str(state.beats)
+        ET.SubElement(note, "voice").text = str(get_xml_voice(staff_num, rhythmic_layer))
         ET.SubElement(note, "type").text = DURATION_NAMES[0]
 
     for _ in range(model_duration.dots):
         ET.SubElement(note, "dot")
 
-    if model_duration.actual_notes != model_duration.normal_notes:
+    if model_note.double_tremolo_role is not None:
+        time_mod = ET.SubElement(note, "time-modification")
+        ET.SubElement(time_mod, "actual-notes").text = "2"
+        ET.SubElement(time_mod, "normal-notes").text = "1"
+    elif model_duration.actual_notes != model_duration.normal_notes:
         time_mod = ET.SubElement(note, "time-modification")
         ET.SubElement(time_mod, "actual-notes").text = str(model_duration.actual_notes)
         ET.SubElement(time_mod, "normal-notes").text = str(model_duration.normal_notes)
 
-    staff_num = get_staff(model_note)
-    slur_number = staff_num
-    ET.SubElement(note, "voice").text = str(get_xml_voice(staff_num, rhythmic_layer))
     ET.SubElement(note, "staff").text = str(staff_num)
 
-    build_articulations(note, model_note.articulation, tuplet_mark, state)
+    build_articulations(
+        note,
+        model_note.articulation,
+        tuplet_mark,
+        state,
+        model_note.double_tremolo_role,
+    )
     build_slurs(note, model_note.slur, slur_number)
     build_image_position(note, model_note)
 
@@ -811,7 +882,7 @@ def build_note_chord(
 
 def _group_notes(notes: list[EncodedSymbol]) -> dict[Fraction, list[EncodedSymbol]]:
     groups_by_duration = defaultdict(list)
-    max_duration = max([n.get_duration().fraction for n in notes])
+    max_duration = max([n.get_effective_duration_fraction() for n in notes])
     for note in notes:
         duration = note.get_duration()
         is_grace = "G" in note.rhythm
@@ -820,7 +891,7 @@ def _group_notes(notes: list[EncodedSymbol]) -> dict[Fraction, list[EncodedSymbo
         elif duration.fraction.numerator == 0:
             fraction = max_duration
         else:
-            fraction = duration.fraction
+            fraction = note.get_effective_duration_fraction()
         groups_by_duration[fraction].append(note)
     return dict(sorted(groups_by_duration.items()))
 
@@ -867,7 +938,7 @@ def find_division_and_time_signature_nominator(voice: list[SymbolChord]) -> tupl
         else:
             for symbol in chord.symbols:
                 if symbol.rhythm.startswith(("note", "rest")):
-                    frac = symbol.get_duration().fraction
+                    frac = symbol.get_effective_duration_fraction()
                     if frac > Fraction(0):
                         durations.append(frac)
             duration = chord.get_duration()

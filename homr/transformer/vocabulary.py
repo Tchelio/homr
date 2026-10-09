@@ -312,8 +312,42 @@ class EncodedSymbol:
         # this ordering can be used to reject cases where attention-based coordinates
         # violate monotonic scan constraints and are therefore unreliable.
         self.coordinates = coordinates
+        # Coordinates in the preprocessed page space, before mapping back to the user's
+        # source image. Unlike `coordinates`, these are not transformer-canvas coordinates.
+        self.page_coordinates: tuple[float, float] | None = None
         # The coordinates mapped back to the image which was given to homr as input
         self.image_coordinates: tuple[float, float] | None = None
+        # A transformer `barline` token is semantic evidence, not precise localization.
+        # When Stage-1 has a nearby vertical/barline box, keep that independent image
+        # geometry here so opt-in profiles can build system-level barline consensus.
+        self.barline_geometry_page_x: float | None = None
+        self.barline_geometry_unit_size: float = 0.0
+        # Optional inference diagnostics. The decoder keeps a few alternative pitch
+        # hypotheses so downstream opt-in profiles can reconcile an uncertain pitch
+        # against independent musical / geometric evidence instead of hard-coding a
+        # replacement. These values do not participate in symbol equality or XML output.
+        self.pitch_candidates: list[tuple[str, float]] = []
+        self.rhythm_candidates: list[tuple[str, float]] = []
+        # Independent image evidence. These are intentionally diagnostics / candidate signals;
+        # only opt-in reconciliation profiles may use them to alter recognition.
+        self.visual_notehead_solid_score: float = 0.0
+        self.visual_tremolo_with_next_bars: int = 0
+        # Measure-level independent visual/decoder diagnostics. These are populated while
+        # the staff still has access to page coordinates, then consumed by fail-closed
+        # consistency validators after systems have been concatenated into voices.
+        self.visual_measure_notehead_count: int = -1
+        self.visual_measure_note_count: int = -1
+        self.visual_measure_rhythm_confidence_median: float = 1.0
+        self.visual_measure_pitch_confidence_median: float = 1.0
+        self.structural_visual_mismatch: bool = False
+        self.suppressed_barline_after_page_x: float | None = None
+        self.structural_recovery: bool = False
+        # Reconciliation metadata. A confirmed double-note tremolo keeps its written note
+        # type but occupies half that note's nominal duration. Keeping that distinction here
+        # lets measure inference and MusicXML serialization agree on the same timing model.
+        self.duration_multiplier: Fraction = Fraction(1)
+        self.double_tremolo_role: str | None = None
+        self.double_tremolo_source: str | None = None
         self._duration: SymbolDuration | None = None
 
     def is_control_symbol(self) -> bool:
@@ -438,6 +472,9 @@ class EncodedSymbol:
         duration = kern_to_symbol_duration(kern)
         self._duration = duration
         return duration
+
+    def get_effective_duration_fraction(self) -> Fraction:
+        return self.get_duration().fraction * self.duration_multiplier
 
     def __str__(self) -> str:
         return str.join(

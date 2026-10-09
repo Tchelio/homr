@@ -142,6 +142,30 @@ class ScoreDecoder:
                 position=position_token[0],
                 coordinates=attention,
             )
+            rhythm_logits = rhythmsp[0, -1, :]
+            top_rhythm_indices = np.argsort(rhythm_logits)[-5:][::-1]
+            max_rhythm_logit = float(np.max(rhythm_logits))
+            exp_rhythm_logits = np.exp(rhythm_logits - max_rhythm_logit)
+            rhythm_probability_sum = float(np.sum(exp_rhythm_logits))
+            symbol.rhythm_candidates = [
+                (
+                    self.inv_rhythm_vocab[int(index)],
+                    float(exp_rhythm_logits[int(index)] / rhythm_probability_sum),
+                )
+                for index in top_rhythm_indices
+            ]
+            pitch_logits = pitchsp[0, -1, :]
+            top_pitch_indices = np.argsort(pitch_logits)[-3:][::-1]
+            max_logit = float(np.max(pitch_logits))
+            exp_logits = np.exp(pitch_logits - max_logit)
+            probability_sum = float(np.sum(exp_logits))
+            symbol.pitch_candidates = [
+                (
+                    self.inv_pitch_vocab[int(index)],
+                    float(exp_logits[int(index)] / probability_sum),
+                )
+                for index in top_pitch_indices
+            ]
             symbols.append(symbol)
 
             out_lift = np.concatenate((out_lift, lift_sample), axis=-1)

@@ -35,6 +35,7 @@ from homr.note_detection import add_notes_to_staffs, combine_noteheads_with_stem
 from homr.onnx_providers import coreml_available, cuda_available, rocm_available
 from homr.pdf_utils import render_pdf_to_image
 from homr.point_mapping import PointMapping, chain, undo_crop, undo_resize
+from homr.profiles import PROFILE_NAMES
 from homr.relieur import process_concat
 from homr.resize import resize_image
 from homr.segmentation.config import segnet_path_onnx, segnet_path_onnx_fp16
@@ -107,13 +108,24 @@ def replace_extension(path: str, new_extension: str) -> str:
     return os.path.splitext(path)[0] + new_extension
 
 
+def read_image(image_path: str) -> NDArray | None:
+    """Read an image from paths that may contain non-ASCII characters on Windows."""
+    try:
+        encoded = np.fromfile(image_path, dtype=np.uint8)
+    except OSError:
+        return None
+    if encoded.size == 0:
+        return None
+    return cv2.imdecode(encoded, cv2.IMREAD_COLOR)
+
+
 def load_and_preprocess_predictions(
     image_path: str, enable_debug: bool, enable_cache: bool, segnet_use_gpu: bool
 ) -> tuple[InputPredictions, Debug, PointMapping]:
     """
     The returned mapping takes coordinates of the predictions back to the input image.
     """
-    image = cv2.imread(image_path)
+    image = read_image(image_path)
     if image is None:
         raise InvalidProgramArgumentException(
             "The file format is not supported, please provide a JPG or PNG image file:" + image_path
@@ -190,7 +202,7 @@ def process_image(
     debug_cleanup: Debug | None = None
     try:
         if config.read_staff_positions:
-            image = cv2.imread(image_path)
+            image = read_image(image_path)
             if image is None:
                 raise ValueError("Failed to read " + image_path)
             original_shape = image.shape
@@ -207,8 +219,19 @@ def process_image(
             # (predictions.preprocessed). Apply the same CLAHE preprocessing here so the
             # two code paths feed the symbol-recognition encoder consistent input.
             image = color_adjust.apply_clahe(image)
+            notehead_mask = None
+            bar_line_boxes = None
         else:
-            multi_staffs, image, debug, title_future, _, to_input_image = detect_staffs_in_image(
+            (
+                multi_staffs,
+                image,
+                debug,
+                title_future,
+                _,
+                to_input_image,
+                notehead_mask,
+                bar_line_boxes,
+            ) = detect_staffs_in_image(
                 image_path, config
             )
         debug_cleanup = debug
@@ -224,6 +247,8 @@ def process_image(
             selected_staff=config.selected_staff,
             config=transformer_config,
             page_to_input_image=to_input_image,
+            notehead_mask=notehead_mask,
+            bar_line_boxes=bar_line_boxes,
         )
 
         if not config.read_staff_positions:
@@ -255,7 +280,16 @@ def process_image(
 
 def detect_staffs_in_image(
     image_path: str, config: ProcessingConfig
-) -> tuple[list[MultiStaff], NDArray, Debug, Future[str], int, PointMapping]:
+) -> tuple[
+    list[MultiStaff],
+    NDArray,
+    Debug,
+    Future[str],
+    int,
+    PointMapping,
+    NDArray,
+    list[RotatedBoundingBox],
+]:
     predictions, debug, to_input_image = load_and_preprocess_predictions(
         image_path, config.enable_debug, config.enable_cache, config.segnet_use_gpu
     )
@@ -322,7 +356,16 @@ def detect_staffs_in_image(
 
     debug.write_all_bounding_boxes_alternating_colors("notes", multi_staffs, notes)
 
-    return multi_staffs, predictions.preprocessed, debug, title_future, len(staffs), to_input_image
+    return (
+        multi_staffs,
+        predictions.preprocessed,
+        debug,
+        title_future,
+        len(staffs),
+        to_input_image,
+        predictions.notehead,
+        bar_line_boxes,
+    )
 
 
 def get_all_image_files_in_folder(folder: str) -> list[str]:
@@ -464,6 +507,12 @@ def main() -> None:
     parser.add_argument(
         "--no-title", action="store_true", help="Don't detect title for faster inference"
     )
+    parser.add_argument(
+        "--profile",
+        choices=PROFILE_NAMES,
+        help="Apply an optional score-specific processing profile. Without this option, "
+        + "homr keeps its default behavior.",
+    )
 
     args = parser.parse_args()
 
@@ -503,7 +552,7 @@ def main() -> None:
     )
 
     xml_generator_args = XmlGeneratorArguments(
-        args.output_large_page, args.output_metronome, args.output_tempo
+        args.output_large_page, args.output_metronome, args.output_tempo, args.profile
     )
     if args.debug:
         eprint(f"Using Log Level {2} for OnnxRuntime")
